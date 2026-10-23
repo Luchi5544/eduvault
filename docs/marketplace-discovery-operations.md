@@ -8,6 +8,17 @@ Material writes increment `searchVersion` and enqueue a `material_search_sync` o
 
 The target operational measure is edit-to-search visibility latency: record `updatedAt` on the material and `projectedAt` on the search document, then report `projectedAt - updatedAt`. The default worker poll interval is 5 seconds (`SIDE_EFFECT_POLL_MS`), so normal propagation should be measured in seconds rather than treated as synchronous.
 
+## Public visibility boundary
+
+Public catalog lists, direct marketplace lookups, collection and saved-material
+traversal, feedback/review operations, and preview descriptors use the same
+canonical material visibility rules. Private, restricted, archived, deleted,
+moderated, legally removed, and quarantined materials are not returned through
+these paths. Learner exports omit titles for linked materials that are no
+longer publicly visible. Catalog cache entries are checked against current
+source visibility and versions before they are served; writes that change
+catalog visibility invalidate the catalog cache revision.
+
 ## Privacy-preserving analytics methodology
 
 Analytics is designed to provide maintainers and creators with reliability and

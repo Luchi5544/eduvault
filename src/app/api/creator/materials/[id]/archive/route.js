@@ -13,6 +13,7 @@ import {
   enqueueMaterialSearchProjection,
   enqueueMaterialSearchDeletion,
 } from "@/lib/backend/materialSearchProjection";
+import { invalidateCatalogCache } from "@/lib/cache/redis";
 
 function normalizeAddress(addr) {
   return String(addr || "").trim().toLowerCase();
@@ -107,6 +108,7 @@ async function handleArchive(request, context) {
 
         await db.collection("materials").updateOne(query, { $set: updateDoc });
         const updatedMaterial = { ...material, ...updateDoc };
+        await invalidateCatalogCache();
 
         if (archived) {
           // Remove the material from all search indexes so restricted records cannot
@@ -125,7 +127,6 @@ async function handleArchive(request, context) {
             now,
           });
         }
-
         auditLog({
           event: archived ? "material_archived" : "material_restored",
           route: "creator/materials/[id]/archive",

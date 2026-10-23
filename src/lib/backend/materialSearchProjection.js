@@ -4,6 +4,37 @@ export const MATERIAL_SEARCH_RECONCILIATION_COLLECTION = "material_search_reconc
 
 const RESTRICTED_MODERATION_STATUSES = new Set(["suspended", "removed", "rejected", "pending_review"]);
 
+export function buildPublicMaterialQuery() {
+  return {
+    visibility: "public",
+    archived: { $ne: true },
+    isDeleted: { $ne: true },
+    creatorSuspended: { $ne: true },
+    moderationStatus: { $nin: [...RESTRICTED_MODERATION_STATUSES] },
+    legalTombstone: { $ne: true },
+    legalRemovedAt: { $exists: false },
+    legalRemovalId: { $exists: false },
+    $or: [
+      { quarantineState: "clean" },
+      { quarantineState: { $exists: false } },
+    ],
+  };
+}
+
+export function buildPublicCollectionQuery() {
+  return {
+    $and: [
+      { $or: [{ visibility: "public" }, { visibility: { $exists: false } }] },
+      { isDeleted: { $ne: true } },
+      { archived: { $ne: true } },
+      { moderationStatus: { $nin: [...RESTRICTED_MODERATION_STATUSES] } },
+      { legalTombstone: { $ne: true } },
+      { legalRemovedAt: { $exists: false } },
+      { legalRemovalId: { $exists: false } },
+    ],
+  };
+}
+
 function normalizeId(value) {
   return String(value?._id ?? value?.materialId ?? value ?? "");
 }
@@ -36,7 +67,11 @@ export function getMaterialSearchVersion(material) {
 
 export function evaluateMaterialSearchAccess(material) {
   if (!material) return { searchable: false, reason: "missing_material", permanent: false };
-  if (material.legalTombstone === true || material.legalRemovedAt || material.legalRemovalId) {
+  if (
+    material.legalTombstone === true ||
+    Object.prototype.hasOwnProperty.call(material, "legalRemovedAt") ||
+    Object.prototype.hasOwnProperty.call(material, "legalRemovalId")
+  ) {
     return { searchable: false, reason: "legal_tombstone", permanent: true };
   }
   if (material.isDeleted === true) return { searchable: false, reason: "soft_deleted", permanent: false };
@@ -45,6 +80,9 @@ export function evaluateMaterialSearchAccess(material) {
   if (material.creatorSuspended === true) return { searchable: false, reason: "creator_suspended", permanent: false };
   if (RESTRICTED_MODERATION_STATUSES.has(material.moderationStatus)) {
     return { searchable: false, reason: `moderation_${material.moderationStatus}`, permanent: false };
+  }
+  if (material.quarantineState !== undefined && material.quarantineState !== "clean") {
+    return { searchable: false, reason: `quarantine_${material.quarantineState}`, permanent: false };
   }
   return { searchable: true, reason: "public", permanent: false };
 }
@@ -124,6 +162,35 @@ export async function enqueueMaterialSearchProjection({
     sourceId: materialId,
     deliveryId: `material-search:${materialId}:${version}:${reason || "material_changed"}`,
     intent: buildMaterialSearchIntent(material, { reason, now }),
+  });
+}
+
+export async function enqueueMaterialSearchDeletion({
+  db,
+  material,
+  reason = "material_deleted",
+  session,
+  enqueue,
+  now = new Date(),
+}) {
+  const wasSearchable = evaluateMaterialSearchAccess(material).searchable;
+  const deletionMaterial = wasSearchable
+    ? {
+        ...material,
+        isDeleted: true,
+        deletedAt: now,
+        updatedAt: now,
+        searchVersion: getMaterialSearchVersion(material) + 1,
+      }
+    : material;
+
+  return enqueueMaterialSearchProjection({
+    db,
+    material: deletionMaterial,
+    reason,
+    session,
+    enqueue,
+    now,
   });
 }
 

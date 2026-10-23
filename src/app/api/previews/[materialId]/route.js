@@ -15,6 +15,7 @@ import { ObjectId } from "mongodb";
 import { withApiHardening } from "@/lib/api/hardening";
 import { getDb } from "@/lib/mongodb";
 import { COLLECTIONS } from "@/lib/backend/schemaContracts";
+import { buildPublicMaterialQuery } from "@/lib/backend/materialSearchProjection";
 import { getPreview, PREVIEW_STATES } from "@/lib/backend/previewStore";
 
 export const runtime = "nodejs";
@@ -47,16 +48,15 @@ export async function GET(request, { params }) {
       const materialId = (await params).materialId;
       const db = await getDb();
 
-      const query = { isDeleted: { $ne: true } };
+      const idQuery = {};
       try {
-        query._id = new ObjectId(materialId);
+        idQuery._id = new ObjectId(materialId);
       } catch {
-        query._id = undefined;
-        query.materialId = materialId;
+        idQuery.materialId = materialId;
       }
 
-      const material = await db.collection(COLLECTIONS.materials).findOne(query, {
-        projection: { storageKey: 1, visibility: 1 },
+      const material = await db.collection(COLLECTIONS.materials).findOne({
+        $and: [idQuery, buildPublicMaterialQuery()],
       });
       if (!material || !material.storageKey) {
         return json({ error: "not found" }, 404);

@@ -13,6 +13,8 @@ import {
   materialVisibility,
 } from "@/lib/search/index";
 import { sanitizeMaterialPublic } from "@/lib/storage/protectedStorage";
+import { enqueueMaterialSearchDeletion, enqueueMaterialSearchProjection, getMaterialSearchVersion } from "@/lib/backend/materialSearchProjection";
+import { invalidateCatalogCache } from "@/lib/cache/redis";
 
 const PAGE_SIZE = 10;
 
@@ -32,7 +34,7 @@ function isVisibleTo(material, userAddress) {
     return material.userAddress === userAddress;
   }
   if (visibility === "restricted") {
-    if (material.userAddress === userAdress) return true;
+    if (material.userAddress === userAddress) return true;
     const allowed = Array.isArray(material.allowedAddresses)
       ? material.allowedAddresses
       : [];
@@ -149,6 +151,8 @@ export async function PATCH(request) {
         if (typeof body.visibility !== "undefined") update.visibility = body.visibility;
         if (typeof body.allowedAddresses !== "undefined") update.allowedAddresses = body.allowedAddresses;
         if (typeof body.archived !== "undefined") update.archived = body.archived;
+        update.version = Number(existing.version || 1) + 1;
+        update.searchVersion = Number(existing.searchVersion || existing.version || 1) + 1;
 
         const result = await db.collection("materials").findOneAndUpdate(
           { _id: id },
@@ -158,6 +162,12 @@ export async function PATCH(request) {
 
         const updated = result.value || result;
         if (updated) {
+          await invalidateCatalogCache();
+          await enqueueMaterialSearchProjection({
+            db,
+            material: updated,
+            reason: "creator_material_updated",
+          });
           if (updated.archived === true) {
             await removeMaterialFromIndex(db, updated);
           } else {
@@ -232,6 +242,16 @@ export async function DELETE(request) {
         }
 
         await db.collection("materials").deleteOne({ _id: id });
+        await invalidateCatalogCache();
+        await enqueueMaterialSearchDeletion({
+          db,
+          material: {
+            ...existing,
+            isDeleted: true,
+            searchVersion: getMaterialSearchVersion(existing) + 1,
+          },
+          reason: "creator_material_deleted",
+        });
         await removeMaterialFromIndex(db, existing);
 
         auditLog({

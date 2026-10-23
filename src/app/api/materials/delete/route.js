@@ -129,12 +129,12 @@ export async function POST(request) {
       return NextResponse.json({ error: message }, { status })
     }
 
+    await invalidateCatalogCache()
     await enqueueMaterialSearchProjection({
       db,
       material: result.updatedMaterial,
       reason: action === 'delete' ? 'material_soft_deleted' : 'material_restored',
     })
-    await invalidateCatalogCache()
 
     await appendCriticalMutation({
       db,

@@ -6,6 +6,7 @@ import { auditLog } from "@/lib/api/audit";
 import { getUserFromCookie } from "@/lib/api/auth";
 import { withApiHardening } from "@/lib/api/hardening";
 import { getDb } from "@/lib/mongodb";
+import { buildPublicMaterialQuery } from "@/lib/backend/materialSearchProjection";
 import {
   FEEDBACK_COLLECTION,
   feedbackModerationPlaceholder,
@@ -24,7 +25,9 @@ function materialObjectId(id) {
 async function findPublicMaterial(db, id) {
   const objectId = materialObjectId(id);
   if (!objectId) return null;
-  return db.collection("materials").findOne({ _id: objectId, visibility: "public" });
+  return db.collection("materials").findOne({
+    $and: [{ _id: objectId }, buildPublicMaterialQuery()],
+  });
 }
 
 function feedbackFilter(id) {

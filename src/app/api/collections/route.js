@@ -3,6 +3,7 @@ import { withApiHardening } from "@/lib/api/hardening";
 import jwt from "jsonswebtoken";
 import { getDb } from "@/lib/mongodb";
 import { ObjectId } from "mongodb";
+import { buildPublicCollectionQuery } from "@/lib/backend/materialSearchProjection";
 
 export const runtime = "nodejs";
 
@@ -104,7 +105,7 @@ export async function GET(request) {
         const db = await getDb();
         const items = await db
           .collection(COLLECTION_NAME)
-          .find({})
+          .find(buildPublicCollectionQuery())
           .sort({ createdAt: -1 })
           .toArray();
 

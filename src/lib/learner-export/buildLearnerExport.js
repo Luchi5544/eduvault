@@ -27,6 +27,7 @@ import {
   EntitlementState,
   buildSummary,
 } from './schema.js';
+import { evaluateMaterialSearchAccess } from '../backend/materialSearchProjection.js';
 
 /**
  * @param {object} opts
@@ -68,6 +69,7 @@ export function buildLearnerExport({
     const ent        = entitlementByMaterial.get(p.materialId);
     const refund     = refundByPurchaseId.get(p.purchaseId ?? String(p._id));
     const material   = materialByMaterialId.get(p.materialId);
+    const visibleMaterial = evaluateMaterialSearchAccess(material).searchable ? material : null;
     const progress   = progressByMaterialId.get(p.materialId);
     const snapshot   = p.purchaseSnapshot ?? {};
 
@@ -132,7 +134,7 @@ export function buildLearnerExport({
     return {
       purchaseId:      p.purchaseId ?? String(p._id),
       materialId:      p.materialId ?? null,
-      materialTitle:   material?.title ?? null,
+      materialTitle:   visibleMaterial?.title ?? null,
       asset:           p.asset   ?? null,
       amount:          toNumber(p.amount),
       platformFee:     toNumber(snapshot.platformFee ?? 0),

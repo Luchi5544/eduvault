@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { withApiHardening } from "@/lib/api/hardening";
 import { getDb } from "@/lib/mongodb";
 import { ObjectId } from "mongodb";
+import { buildPublicCollectionQuery, buildPublicMaterialQuery } from "@/lib/backend/materialSearchProjection";
+import { sanitizeMaterialPublic } from "@/lib/storage/protectedStorage";
 
 export const runtime = "nodejs";
 
@@ -21,7 +23,9 @@ export async function GET(request, { params }) {
           return NextResponse.json({ error: "Invalid collection ID" }, { status: 400 });
         }
 
-        const collection = await db.collection("collections").findOne(query);
+        const collection = await db.collection("collections").findOne({
+          $and: [query, buildPublicCollectionQuery()],
+        });
 
         if (!collection) {
           return NextResponse.json({ error: "Collection not found" }, { status: 404 });
@@ -33,10 +37,15 @@ export async function GET(request, { params }) {
           const materialObjectIds = collection.materialIds.map(id => {
             try { return new ObjectId(id); } catch { return id; }
           });
-          materials = await db.collection("materials").find({ _id: { $in: materialObjectIds } }).toArray();
+          materials = await db.collection("materials").find({
+            $and: [
+              { _id: { $in: materialObjectIds } },
+              buildPublicMaterialQuery(),
+            ],
+          }).toArray();
         }
 
-        return NextResponse.json({ ...collection, materials });
+        return NextResponse.json({ ...collection, materials: materials.map(sanitizeMaterialPublic) });
       } catch (err) {
         return NextResponse.json({ error: "Server error" }, { status: 500 });
       }

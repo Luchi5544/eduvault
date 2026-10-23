@@ -6,6 +6,8 @@ import {
   MATERIAL_SEARCH_RECONCILIATION_COLLECTION,
   MATERIAL_SEARCH_TOMBSTONE_COLLECTION,
   applyMaterialSearchProjection,
+  buildPublicCollectionQuery,
+  buildPublicMaterialQuery,
   buildMaterialSearchIntent,
   buildMaterialSearchDocument,
   enqueueMaterialSearchProjection,
@@ -138,10 +140,33 @@ test("search access policy excludes private, archived, suspended, deleted, and l
   assert.equal(evaluateMaterialSearchAccess(material({ archived: true })).reason, "archived");
   assert.equal(evaluateMaterialSearchAccess(material({ creatorSuspended: true })).reason, "creator_suspended");
   assert.equal(evaluateMaterialSearchAccess(material({ isDeleted: true })).reason, "soft_deleted");
+  assert.equal(evaluateMaterialSearchAccess(material({ moderationStatus: "pending_review" })).searchable, false);
+  assert.equal(evaluateMaterialSearchAccess(material({ quarantineState: "manual_review" })).searchable, false);
+  assert.equal(evaluateMaterialSearchAccess(material({ legalRemovedAt: null })).searchable, false);
   assert.deepEqual(
     evaluateMaterialSearchAccess(material({ legalTombstone: true })),
     { searchable: false, reason: "legal_tombstone", permanent: true },
   );
+});
+
+test("public material query shares the projection access boundary", () => {
+  const query = buildPublicMaterialQuery();
+  assert.equal(query.visibility, "public");
+  assert.equal(query.archived.$ne, true);
+  assert.equal(query.isDeleted.$ne, true);
+  assert.ok(query.moderationStatus.$nin.includes("pending_review"));
+  assert.equal(query.legalRemovedAt.$exists, false);
+  assert.equal(query.legalRemovalId.$exists, false);
+});
+
+test("public collection query excludes private, restricted, and retired collections", () => {
+  const query = buildPublicCollectionQuery();
+  assert.equal(query.$and[0].$or[0].visibility, "public");
+  assert.equal(query.$and[0].$or[1].visibility.$exists, false);
+  assert.equal(query.$and[1].isDeleted.$ne, true);
+  assert.equal(query.$and[2].archived.$ne, true);
+  assert.ok(query.$and[3].moderationStatus.$nin.includes("removed"));
+  assert.equal(query.$and[4].legalTombstone.$ne, true);
 });
 
 test("projection stores only search-safe fields for public materials", () => {

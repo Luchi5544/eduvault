@@ -122,7 +122,7 @@ describe('exportLearnerData — valid export', () => {
       purchases:    [makePurchase()],
       entitlements: [makeEntitlement()],
       refunds:      [],
-      materials:    [{ materialId: 'mat_a', title: 'Course A' }],
+      materials:    [{ materialId: 'mat_a', title: 'Course A', visibility: 'public' }],
       progressRecords: [makeProgress()],
     });
 
@@ -148,6 +148,25 @@ describe('exportLearnerData — valid export', () => {
     expect(doc.redactionLevel).toBe(RedactionLevel.FULL);
     expect(doc.identity.email).toBe('a@example.com');
     expect(doc.identity.fullName).toBe('Learner A');
+  });
+
+  it('omits linked titles for private, deleted, and restricted materials', () => {
+    const doc = exportLearnerData({
+      requester: makeRequester(),
+      subject: makeSubject(),
+      purchases: [
+        makePurchase({ materialId: 'private' }),
+        makePurchase({ _id: 'p2', purchaseId: 'p2', materialId: 'deleted' }),
+        makePurchase({ _id: 'p3', purchaseId: 'p3', materialId: 'restricted' }),
+      ],
+      materials: [
+        { materialId: 'private', title: 'Private course', visibility: 'private' },
+        { materialId: 'deleted', title: 'Deleted course', visibility: 'public', isDeleted: true },
+        { materialId: 'restricted', title: 'Restricted course', visibility: 'public', moderationStatus: 'pending_review' },
+      ],
+    });
+
+    expect(doc.purchases.map((purchase) => purchase.materialTitle)).toEqual([null, null, null]);
   });
 });
 

@@ -6,6 +6,8 @@ import { withApiHardening } from "@/lib/api/hardening";
 import { getUserFromCookie } from "@/lib/api/auth";
 import { sanitizeString } from "@/lib/api/auth";
 import { getDb } from "@/lib/mongodb";
+import { buildPublicMaterialQuery } from "@/lib/backend/materialSearchProjection";
+import { sanitizeMaterialPublic } from "@/lib/storage/protectedStorage";
 import { ObjectId } from "mongodb";
 
 export const runtime = "nodejs";
@@ -51,7 +53,12 @@ export async function GET(request) {
         const materials = materialIds.length > 0
           ? await db
               .collection("materials")
-              .find({ _id: { $in: materialIds } })
+              .find({
+                $and: [
+                  { _id: { $in: materialIds } },
+                  buildPublicMaterialQuery(),
+                ],
+              })
               .toArray()
           : [];
 
@@ -60,21 +67,16 @@ export async function GET(request) {
           materialMap.set(String(m._id), m);
         }
 
-        const result = savedItems.map((saved) => {
+        const result = savedItems.flatMap((saved) => {
           const material = materialMap.get(saved.materialId);
           if (material) {
-            const { storageKey, fileUrl, metadataUrl, ...safe } = material;
-            return {
+            return [{
               id: saved._id,
               savedAt: saved.savedAt,
-              material: safe,
-            };
+              material: sanitizeMaterialPublic(material),
+            }];
           }
-          return {
-            id: saved._id,
-            savedAt: saved.savedAt,
-            materialId: saved.materialId,
-          };
+          return [];
         });
 
         return NextResponse.json({ items: result });
@@ -114,7 +116,12 @@ export async function POST(request) {
 
         const db = await getDb();
 
-        const material = await db.collection("materials").findOne({ _id: new ObjectId(materialId) });
+        const material = await db.collection("materials").findOne({
+          $and: [
+            { _id: new ObjectId(materialId) },
+            buildPublicMaterialQuery(),
+          ],
+        });
         if (!material) {
           return NextResponse.json({ error: "Material not found" }, { status: 404 });
         }

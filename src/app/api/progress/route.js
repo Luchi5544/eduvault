@@ -3,6 +3,7 @@ import { withApiHardening } from "@/lib/api/hardening";
 import jwt from "jsonwebtoken";
 import { getDb } from "@/lib/mongodb";
 import { ObjectId } from "mongodb";
+import { buildPublicMaterialQuery } from "@/lib/backend/materialSearchProjection";
 
 export const runtime = "nodejs";
 
@@ -81,7 +82,12 @@ export async function GET(request) {
           try { return new ObjectId(item.materialId); } catch { return item.materialId; }
         });
 
-        const materials = await db.collection("materials").find({ _id: { $in: materialObjectIds } }).toArray();
+        const materials = await db.collection("materials").find({
+          $and: [
+            { _id: { $in: materialObjectIds } },
+            buildPublicMaterialQuery(),
+          ],
+        }).toArray();
 
         // Merge material details into progress items
         const results = items.map(item => {

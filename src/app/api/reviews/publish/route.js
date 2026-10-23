@@ -6,6 +6,7 @@ import { withApiHardening } from "@/lib/api/hardening";
 import { getDb } from "@/lib/mongodb";
 import { ObjectId } from "mongodb";
 import { cacheDel } from "@/lib/cache/redis";
+import { buildPublicMaterialQuery } from "@/lib/backend/materialSearchProjection";
 
 export const runtime = "nodejs";
 
@@ -59,8 +60,10 @@ export async function POST(request) {
 
         // 1. Verify the material exists and is public
         const material = await db.collection("materials").findOne({
-          _id: new ObjectId(materialId),
-          visibility: "public",
+          $and: [
+            { _id: new ObjectId(materialId) },
+            buildPublicMaterialQuery(),
+          ],
         });
 
         if (!material) {
