@@ -296,6 +296,8 @@ export const REQUIRED_INDEXES = {
   support_sessions: [
     // Lookup is by hash of the bearer token, never the raw token.
     { keys: { tokenHash: 1 }, options: { unique: true, name: "support_sessions_token_hash_idx" } },
+    // A signed grant approval may create only one support session.
+    { keys: { approvalIntentId: 1 }, options: { unique: true, sparse: true, name: "support_sessions_approval_intent_idx" } },
     // "Does this user have an active support session?" (user-facing notices).
     { keys: { targetUserId: 1, status: 1, expiresAt: 1 }, options: { name: "support_sessions_target_idx" } },
     // "Which sessions did this maintainer start?" (admin listing / forensics).

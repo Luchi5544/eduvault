@@ -24,9 +24,15 @@ import crypto from "node:crypto";
 import { ObjectId } from "mongodb";
 import { COLLECTIONS } from "../backend/schemaContracts.js";
 import { appendAuditRecord } from "../backend/auditLedger.js";
+import {
+  assertApprovalReceiptValid,
+  loadApprovalIntent,
+  loadApprovalReceipt,
+} from "../approvals/maintainerApprovalFlow.js";
 import { isSuspendedUser } from "./suspension.js";
 
 export const SUPPORT_SESSION_COOKIE = "support_session";
+export const SUPPORT_ACCESS_GRANT_ACTION = "MAINTAINER_ACCESS_GRANT";
 export const SUPPORT_SESSION_DEFAULT_TTL_MS = 30 * 60 * 1000;
 export const SUPPORT_SESSION_MIN_TTL_MS = 5 * 60 * 1000;
 export const SUPPORT_SESSION_MAX_TTL_MS = 60 * 60 * 1000;
@@ -125,10 +131,55 @@ export function toUserSafeNotice(session) {
     status: session.status,
     scopes: session.scopes || [],
     reason: session.reason || null,
+    approvedBy: session.approvedBy || null,
     startedAt: toDate(session.createdAt, new Date()).toISOString(),
     expiresAt: toDate(session.expiresAt, new Date()).toISOString(),
     lastUsedAt: session.lastUsedAt ? toDate(session.lastUsedAt, new Date()).toISOString() : null,
     useCount: Number(session.useCount || 0),
+  };
+}
+
+export async function verifySupportGrantApproval({
+  db,
+  approvalIntentId,
+  actorWallet,
+  targetUserId,
+  reason,
+  scopes,
+  ttlMs,
+  now = new Date(),
+} = {}) {
+  if (!approvalIntentId) throw supportError("An approved grant intent is required.", "approval_required");
+  if (!actorWallet) throw supportError("The proposing admin wallet is required.", "approval_actor_required");
+
+  const intent = await loadApprovalIntent(db, approvalIntentId, { now });
+  const receipt = await loadApprovalReceipt(db, approvalIntentId);
+  if (!intent || !receipt) {
+    throw supportError("The grant approval is missing or expired.", "approval_missing");
+  }
+
+  try {
+    assertApprovalReceiptValid({ intent, receipt, now });
+  } catch (error) {
+    throw supportError(`The grant approval is invalid: ${error.message}`, "approval_invalid");
+  }
+
+  if (
+    intent.actionType !== SUPPORT_ACCESS_GRANT_ACTION ||
+    String(intent.actor).toLowerCase() !== String(actorWallet).toLowerCase() ||
+    intent.target?.type !== "user" ||
+    String(intent.target?.id) !== String(targetUserId) ||
+    intent.reason !== reason ||
+    JSON.stringify(intent.payload?.scopes) !== JSON.stringify(scopes) ||
+    Number(intent.payload?.ttlMs) !== Number(ttlMs)
+  ) {
+    throw supportError("The grant approval does not match the requested target, scope, reason, or expiry.", "approval_mismatch");
+  }
+
+  return {
+    approvedBy: receipt.approverAddress,
+    approvalIntentId: intent.intentId,
+    approvalIntentHash: intent.intentHash,
   };
 }
 
@@ -155,9 +206,11 @@ export async function createSupportSession({
   reason,
   scopes,
   ttlMs,
+  approvalIntentId,
   now = () => new Date(),
   audit = appendAuditRecord,
   tokenFactory,
+  approvalVerifier = verifySupportGrantApproval,
 } = {}) {
   if (!db) throw supportError("createSupportSession requires a db handle", "db_required");
   if (!actor || actor.role !== "admin") {
@@ -179,11 +232,21 @@ export async function createSupportSession({
   const cleanReason = sanitizeSupportReason(reason);
   const sessionScopes = normalizeSupportScopes(scopes);
   const ttl = clampSupportTtl(ttlMs);
+  const createdAt = toDate(now(), new Date());
+  const approval = await approvalVerifier({
+    db,
+    approvalIntentId,
+    actorWallet: actor.walletAddress,
+    targetUserId,
+    reason: cleanReason,
+    scopes: sessionScopes,
+    ttlMs: ttl,
+    now: createdAt,
+  });
 
   const token = tokenFactory ? tokenFactory() : crypto.randomBytes(32).toString("hex");
   const tokenHash = hashSupportToken(token);
   const sessionId = crypto.randomUUID();
-  const createdAt = toDate(now(), new Date());
   const expiresAt = new Date(createdAt.getTime() + ttl);
 
   // Audit FIRST (fail closed): an un-auditable support session must not exist.
@@ -194,8 +257,20 @@ export async function createSupportSession({
     actorContext: { role: "admin", walletAddress: actor.walletAddress || null, via: "support-session" },
     action: SUPPORT_AUDIT_ACTIONS.STARTED,
     target: { type: "user", id: String(targetUserId) },
-    intent: { scopes: sessionScopes, ttlMs: ttl, reason: cleanReason },
-    result: { sessionId, expiresAt: expiresAt.toISOString(), targetUserId: String(targetUserId) },
+    intent: {
+      scopes: sessionScopes,
+      ttlMs: ttl,
+      reason: cleanReason,
+      approvalIntentId: approval.approvalIntentId,
+      approvalIntentHash: approval.approvalIntentHash,
+      approvedBy: approval.approvedBy,
+    },
+    result: {
+      sessionId,
+      expiresAt: expiresAt.toISOString(),
+      targetUserId: String(targetUserId),
+      approvedBy: approval.approvedBy,
+    },
     reason: cleanReason,
   });
 
@@ -207,6 +282,9 @@ export async function createSupportSession({
     actorWallet: actor.walletAddress || null,
     targetUserId: String(targetUserId),
     targetWallet: target.walletAddress || target.walletAddressLower || null,
+    approvedBy: approval.approvedBy,
+    approvalIntentId: approval.approvalIntentId,
+    approvalIntentHash: approval.approvalIntentHash,
     scopes: sessionScopes,
     reason: cleanReason,
     createdAt,
@@ -224,6 +302,9 @@ export async function createSupportSession({
   try {
     await db.collection(COLLECTIONS.supportSessions).insertOne(session);
   } catch (error) {
+    if (error?.code === 11000) {
+      throw supportError("This approval intent has already created a grant.", "approval_already_used");
+    }
     // The ledger keeps the intent record; the caller sees a hard failure and
     // can retry (a new sessionId is generated per attempt).
     throw supportError(`Support session could not be persisted: ${error?.message || error}`, "session_persist_failed");
@@ -251,7 +332,7 @@ export async function resolveSupportSession({
 
   const currentTime = toDate(now(), new Date());
   if (toDate(session.expiresAt, currentTime).getTime() <= currentTime.getTime()) {
-    await markSessionExpired({ db, session, now: currentTime, audit }).catch(() => {});
+    await markSessionExpired({ db, session, now: currentTime, audit });
     return null;
   }
 
@@ -348,7 +429,17 @@ export async function requireSupportAccess({
   const bearer = token || parseSupportCookie(request);
   if (!bearer) return { ok: false, status: 401, error: "Support session is required." };
 
-  const session = await resolveSupportSession({ db, token: bearer, now, audit });
+  let session;
+  try {
+    session = await resolveSupportSession({ db, token: bearer, now, audit });
+  } catch (error) {
+    return {
+      ok: false,
+      status: 503,
+      error: "Support access could not be validated or its expiry could not be audited — refusing to proceed.",
+      cause: error?.code || "support_validation_failed",
+    };
+  }
   if (!session) return { ok: false, status: 401, error: "Support session is missing, expired, or revoked." };
   if (!hasSupportScope(session, scope)) {
     return { ok: false, status: 403, error: `Support session lacks the "${scope}" scope.`, session };
@@ -444,4 +535,38 @@ export async function expireSupportSessions({ db, now = () => new Date(), audit 
   });
 
   return { expired: result?.modifiedCount ?? sessionIds.length, sessionIds };
+}
+
+export function buildSupportGrantReport(sessions, { now = new Date() } = {}) {
+  const currentTime = toDate(now, new Date());
+  const report = { active: [], expired: [], revoked: [] };
+
+  for (const session of sessions || []) {
+    const expiresAt = toDate(session.expiresAt, currentTime);
+    const status = session.status === SUPPORT_SESSION_STATUSES.ACTIVE && expiresAt <= currentTime
+      ? SUPPORT_SESSION_STATUSES.EXPIRED
+      : session.status;
+    const entry = {
+      ...toUserSafeNotice({ ...session, status }),
+      actorId: session.actorId,
+      targetUserId: session.targetUserId,
+      approvedBy: session.approvedBy || null,
+      approvalIntentId: session.approvalIntentId || null,
+      revokedAt: session.revokedAt ? toDate(session.revokedAt, currentTime).toISOString() : null,
+      revokedBy: session.revokedBy || null,
+    };
+
+    if (status === SUPPORT_SESSION_STATUSES.ACTIVE) report.active.push(entry);
+    else if (status === SUPPORT_SESSION_STATUSES.EXPIRED) report.expired.push(entry);
+    else if (status === SUPPORT_SESSION_STATUSES.REVOKED) report.revoked.push(entry);
+  }
+
+  return {
+    counts: {
+      active: report.active.length,
+      expired: report.expired.length,
+      revoked: report.revoked.length,
+    },
+    ...report,
+  };
 }

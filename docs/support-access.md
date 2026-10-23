@@ -19,6 +19,10 @@ Maintainers occasionally need to see what a user sees (billing issues,
   `support.access_used` **before** the action proceeds. If the ledger is
   unavailable: creation throws and use fails closed with HTTP 503. An
   un-auditable support action cannot happen.
+- **Two-person approved** — each grant requires a signed approval receipt
+  from a different admin. The approved intent binds the target, normalized
+  scopes, reason, and clamped TTL; the approval intent can create only one
+  support session.
 - **User-visible** — `GET /api/support/sessions` returns the signed-in user's
   active sessions as sanitized notices (scopes, window, reason — never actor
   ids or token material).
@@ -32,14 +36,29 @@ Maintainers occasionally need to see what a user sees (billing issues,
 | --- | --- | --- |
 | `POST /api/admin/support-sessions` | admin | `{ userId, reason, scopes?, ttlMinutes? }` → creates session, sets cookie. 400 invalid input, 403 non-admin/suspended target, 404 unknown target, 500 persistence failure (no session created) |
 | `GET /api/admin/support-sessions` | admin | Lists sessions started by the calling admin (`?targetUserId=&limit=`) |
+| `POST /api/admin/support-sessions` | proposing admin | `{ approvalOnly: true, userId, reason, scopes?, ttlMinutes? }` → returns a signed-intent message for a second admin |
+| `POST /api/admin/support-sessions` | proposing admin | Grant creation additionally requires `approvalIntentId` for the exact approved intent |
+| `GET /api/admin/support-sessions?report=true` | admin | Reports active, expired, and revoked grants; `limit` is capped at 500 |
 | `DELETE /api/admin/support-sessions/[id]` | admin | Revokes (any admin may revoke; revoker recorded). Clears caller cookie |
 | `GET /api/support/sessions` | signed-in user | Own active sessions as user-safe notices |
+
+Grant workflow:
+
+1. The proposing admin sends `approvalOnly: true` with the requested target,
+   reason, scopes, and TTL. The API returns an intent and signing message.
+2. A different admin approves the intent using the existing signed approval
+   endpoint `POST /api/admin/approvals/{intentId}`.
+3. The proposer creates the grant by repeating the exact target, reason,
+   scopes, and TTL along with `approvalIntentId`. The grant endpoint verifies
+   the stored signature, expiry, action, proposer, and exact grant parameters
+   before creating a support session.
 
 Library surface (`src/lib/auth/supportAccess.js`): `createSupportSession`,
 `resolveSupportSession`, `requireSupportAccess` (the scoped guard any admin
 tool calls), `recordSupportUse`, `revokeSupportSession`,
 `expireSupportSessions`, `buildSupportNotice`, `toUserSafeNotice`,
-`hasSupportScope`.
+`hasSupportScope`, `verifySupportGrantApproval`, and
+`buildSupportGrantReport`.
 
 ```js
 // Guarding an admin tool that needs to act on a user's behalf:
@@ -101,6 +120,7 @@ if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.
 `tests/backend/supportAccess.test.mjs` — admin-only creation, TTL clamping,
 token hashing (raw token never persisted), audit-first fail-closed creation,
 scope enforcement, use auditing + use counting, 401/403/503 guard paths,
-lazy expiry + sweep, revocation, and notice sanitization.
+signed approval binding, grant reporting, lazy expiry + sweep, revocation,
+and notice sanitization.
 
 Run: `npx tsx --test tests/backend/supportAccess.test.mjs`

@@ -19,9 +19,11 @@ import {
   SUPPORT_SESSION_DEFAULT_TTL_MS,
   SUPPORT_SESSION_MAX_TTL_MS,
   SUPPORT_SESSION_MIN_TTL_MS,
+  SUPPORT_ACCESS_GRANT_ACTION,
   buildSupportNotice,
+  buildSupportGrantReport,
   clampSupportTtl,
-  createSupportSession,
+  createSupportSession as createSupportSessionWithApproval,
   expireSupportSessions,
   hasSupportScope,
   hashSupportToken,
@@ -29,9 +31,16 @@ import {
   requireSupportAccess,
   resolveSupportSession,
   revokeSupportSession,
+  verifySupportGrantApproval,
   toUserSafeNotice,
 } from "../../src/lib/auth/supportAccess.js";
 import { COLLECTIONS } from "../../src/lib/backend/schemaContracts.js";
+import {
+  createApprovalIntent,
+  createSignedReceipt,
+  getApprovalSigningMessage,
+} from "../../src/lib/approvals/maintainerApprovalFlow.js";
+import { Keypair } from "@stellar/stellar-sdk";
 
 // ---------------------------------------------------------------------------
 // In-memory fake db
@@ -139,6 +148,138 @@ function createAuditSpy({ fail = false } = {}) {
 
 const ADMIN_ACTOR = { id: "admin-1", role: "admin", walletAddress: "gadmin" };
 const AT_2026 = () => new Date("2026-01-01T00:00:00Z");
+const APPROVER = Keypair.random();
+
+const createSupportSession = async (options = {}) => createSupportSessionWithApproval({
+  ...options,
+  approvalVerifier: options.approvalVerifier || (async ({ approvalIntentId }) => ({
+    approvedBy: APPROVER.publicKey(),
+    approvalIntentId: approvalIntentId || "test-approved-intent",
+    approvalIntentHash: "test-intent-hash",
+  })),
+});
+
+async function approvedGrant({ actorWallet = ADMIN_ACTOR.walletAddress, userId = "user-1", reason = "Investigate access issue", scopes = ["read"], ttlMs = SUPPORT_SESSION_DEFAULT_TTL_MS, now = AT_2026() } = {}) {
+  const intent = createApprovalIntent({
+    actionType: SUPPORT_ACCESS_GRANT_ACTION,
+    actor: actorWallet,
+    target: { type: "user", id: userId },
+    payload: { scopes, ttlMs },
+    reason,
+    now,
+  });
+  const digest = crypto.createHash("sha256").update(getApprovalSigningMessage(intent), "utf8").digest();
+  const signatureHex = APPROVER.sign(digest).toString("hex");
+  return {
+    intent,
+    receipt: createSignedReceipt({
+      intent,
+      approverAddress: APPROVER.publicKey(),
+      signatureHex,
+      decision: "approved",
+      now,
+    }),
+  };
+}
+
+describe("support access — approved grants", () => {
+  test("grant creation fails closed when no approval intent is supplied", async () => {
+    const db = createFakeDb();
+    const audit = createAuditSpy();
+    await assert.rejects(
+      createSupportSessionWithApproval({
+        db,
+        actor: ADMIN_ACTOR,
+        targetUserId: "user-1",
+        reason: "Investigate access issue",
+        scopes: ["read"],
+        now: AT_2026,
+        audit,
+      }),
+      (error) => error.code === "approval_required",
+    );
+    assert.equal(db.collection(COLLECTIONS.supportSessions).docs.length, 0);
+    assert.equal(audit.calls.length, 0);
+  });
+
+  test("requires a valid signed approval bound to exact grant scope and expiry", async () => {
+    const grant = await approvedGrant();
+    const db = {
+      collection(name) {
+        const document = name === COLLECTIONS.maintainerApprovalIntents ? grant.intent : grant.receipt;
+        return { findOne: async () => document };
+      },
+    };
+
+    const approval = await verifySupportGrantApproval({
+      db,
+      approvalIntentId: grant.intent.intentId,
+      actorWallet: ADMIN_ACTOR.walletAddress,
+      targetUserId: "user-1",
+      reason: grant.intent.reason,
+      scopes: ["read"],
+      ttlMs: SUPPORT_SESSION_DEFAULT_TTL_MS,
+      now: AT_2026(),
+    });
+    assert.equal(approval.approvedBy, APPROVER.publicKey());
+
+    await assert.rejects(
+      verifySupportGrantApproval({
+        db,
+        approvalIntentId: grant.intent.intentId,
+        actorWallet: ADMIN_ACTOR.walletAddress,
+        targetUserId: "user-1",
+        reason: grant.intent.reason,
+        scopes: ["billing"],
+        ttlMs: SUPPORT_SESSION_DEFAULT_TTL_MS,
+        now: AT_2026(),
+      }),
+      (error) => error.code === "approval_mismatch",
+    );
+  });
+
+  test("persists approver identity with a valid grant", async () => {
+    const grant = await approvedGrant();
+    const db = createFakeDb();
+    const originalCollection = db.collection;
+    db.collection = (name) => {
+      if (name === COLLECTIONS.maintainerApprovalIntents) {
+        return { findOne: async () => grant.intent };
+      }
+      if (name === COLLECTIONS.maintainerApprovalReceipts) {
+        return { findOne: async () => grant.receipt };
+      }
+      return originalCollection(name);
+    };
+    const { session } = await createSupportSessionWithApproval({
+      db,
+      actor: ADMIN_ACTOR,
+      targetUserId: "user-1",
+      reason: grant.intent.reason,
+      scopes: grant.intent.payload.scopes,
+      ttlMs: grant.intent.payload.ttlMs,
+      approvalIntentId: grant.intent.intentId,
+      now: AT_2026,
+      audit: createAuditSpy(),
+    });
+
+    assert.equal(session.approvedBy, APPROVER.publicKey());
+    assert.equal(session.approvalIntentId, grant.intent.intentId);
+  });
+
+  test("report classifies expired active rows without waiting for the expiry sweep", () => {
+    const report = buildSupportGrantReport([
+      { _id: "active", status: "active", expiresAt: new Date("2026-01-02"), createdAt: AT_2026(), scopes: ["read"] },
+      { _id: "expired", status: "active", expiresAt: new Date("2025-12-31"), createdAt: AT_2026(), scopes: ["read"] },
+      { _id: "revoked", status: "revoked", expiresAt: new Date("2026-01-02"), createdAt: AT_2026(), scopes: ["billing"] },
+    ], { now: AT_2026() });
+
+    assert.deepEqual(report.counts, { active: 1, expired: 1, revoked: 1 });
+    assert.equal(report.active[0].sessionId, "active");
+    assert.equal(report.expired[0].sessionId, "expired");
+    assert.equal(report.revoked[0].sessionId, "revoked");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Creation invariants
@@ -428,6 +569,31 @@ describe("support access — guarded use", () => {
     });
     assert.equal(guard.ok, false);
     assert.equal(guard.status, 503);
+  });
+
+  test("fails closed with 503 when lazy expiry cannot be audited", async () => {
+    const db = createFakeDb();
+    const setupAudit = createAuditSpy();
+    const { token, session } = await createSupportSession({
+      db,
+      actor: ADMIN_ACTOR,
+      targetUserId: "user-1",
+      reason: "debug",
+      scopes: ["read"],
+      audit: setupAudit,
+      now: AT_2026,
+    });
+    const guard = await requireSupportAccess({
+      db,
+      request: requestWithCookie(token),
+      scope: "read",
+      audit: createAuditSpy({ fail: true }),
+      now: () => new Date("2026-01-01T01:00:00Z"),
+    });
+
+    assert.equal(guard.ok, false);
+    assert.equal(guard.status, 503);
+    assert.equal(db.collection(COLLECTIONS.supportSessions).docs.find((doc) => doc._id === session._id).status, "expired");
   });
 
   test("rejects missing, unknown, and expired tokens with 401", async () => {
