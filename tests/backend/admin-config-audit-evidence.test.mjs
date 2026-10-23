@@ -14,10 +14,19 @@ import {
   buildConfigAuditEvidence,
   verifyConfigAuditEvidence,
   verifyConfigAuditChain,
-  applyAdminConfigChange,
+  applyAdminConfigChange as applyAdminConfigChangeRaw,
+  createAdminConfigPreview,
   rollbackConfigChange,
   exportConfigAuditBundle,
 } from '../../src/lib/config/adminConfigAudit.js';
+
+async function applyAdminConfigChange(options) {
+  const preview = options.previewToken
+    ? { previewToken: options.previewToken }
+    : await createAdminConfigPreview(options);
+  const result = await applyAdminConfigChangeRaw({ ...options, previewToken: preview.previewToken });
+  return { ...result, previewToken: preview.previewToken };
+}
 
 function createMockCollection(initialDocs = []) {
   const docs = [...initialDocs];
@@ -211,6 +220,40 @@ describe('Audit Evidence for Administrative Configuration Changes (#1001)', () =
   });
 
   describe('Normal Path & Cryptographic Hash Chaining', () => {
+    test('returns a masked diff without writes and requires the unchanged preview to apply', async () => {
+      const change = {
+        db: mockDb,
+        operationId: 'op-preview-required',
+        settingKey: 'maintenance.global',
+        proposedValue: true,
+        actor: adminActor,
+        reason: 'Enable maintenance after scheduled release',
+      };
+      const preview = await createAdminConfigPreview(change);
+
+      assert.equal(preview.preview.diff.from, false);
+      assert.equal(preview.preview.diff.to, true);
+      assert.equal(preview.preview.requiresSecondaryApproval, false);
+      assert.equal(await evidenceCol.find({}).toArray().then((records) => records.length), 0);
+      assert.equal(await configCol.findOne({ _id: 'maintenance.global' }), null);
+
+      await assert.rejects(
+        applyAdminConfigChangeRaw(change),
+        (error) => error instanceof ConfigAuditError && error.code === 'CONFIG_PREVIEW_REQUIRED'
+      );
+
+      await configCol.updateOne(
+        { _id: 'maintenance.global' },
+        { $set: { _id: 'maintenance.global', value: true } },
+        { upsert: true }
+      );
+      await assert.rejects(
+        applyAdminConfigChangeRaw({ ...change, previewToken: preview.previewToken }),
+        (error) => error instanceof ConfigAuditError && error.code === 'CONFIG_PREVIEW_STALE'
+      );
+      assert.equal(await evidenceCol.find({}).toArray().then((records) => records.length), 0);
+    });
+
     test('applies change, updates active config, and forms verifiable hash chain', async () => {
       const op1 = 'op-101';
       const change1 = await applyAdminConfigChange({
@@ -424,6 +467,7 @@ describe('Audit Evidence for Administrative Configuration Changes (#1001)', () =
         proposedValue: 30,
         actor: adminActor,
         reason: 'Hardening session inactivity timeout (network retry)',
+        previewToken: firstAttempt.previewToken,
       });
 
       assert.equal(secondAttempt.success, true);
@@ -552,6 +596,11 @@ describe('Audit Evidence for Administrative Configuration Changes (#1001)', () =
       assert.equal(rollbackEv.previousEvidenceHash, changeRes.evidence.recordHash);
       assert.equal(rollbackEv.before, 60);
       assert.equal(rollbackEv.after, 90);
+      assert.equal(
+        rollbackEv.reason,
+        `Rollback of ${targetEvidenceId}: Reverting retention window change due to learner feedback`
+      );
+      assert.equal(rollbackEv.approvalEvidence.reason, 'Approved rollback to 90 days');
 
       // 3. Confirm target evidence was NOT deleted or mutated
       const originalEv = await evidenceCol.findOne({ evidenceId: targetEvidenceId });

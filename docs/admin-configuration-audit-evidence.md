@@ -13,7 +13,8 @@ When administrators adjust marketplace fees, payout thresholds, session timeout 
 3. **Actor Commitment Proofs**: Every change binds the administrator's identity, role, setting key, and operation ID into a keyed HMAC commitment (`actorProof`), ensuring changes cannot be repudiated or attributed to another actor.
 4. **Secret Redaction by Design**: Snapshots of previous (`before`) and new (`after`) configurations are automatically scanned and sanitized. Sensitive credentials (such as Stellar secret seeds `S...`, JWTs, Bearer tokens, or password strings) are replaced with `[REDACTED:secret]` before serialization.
 5. **Two-Person Integrity (Dual-Approval Guard)**: High-impact or irreversible configuration changes (e.g. platform fee modifications, payout transaction caps, permanent archive purge retention) require secondary maintainer approval (`approvalEvidence.approver`). Self-approval is strictly forbidden.
-6. **Idempotent Replay**: Client-supplied `operationId` (or `x-idempotency-key`) guarantees that retried network requests return the existing evidence receipt and active state without duplicate writes or sequence conflicts.
+6. **Schema-Driven Preview**: Every new update is validated against the setting registry and must include a short-lived preview token bound to the admin, exact before/after values, reason, and approval evidence. A change to the value after preview makes the token stale.
+7. **Idempotent Replay**: Client-supplied `operationId` (or `x-idempotency-key`) guarantees that retried network requests return the existing evidence receipt and active state without duplicate writes or sequence conflicts.
 
 ---
 
@@ -92,14 +93,14 @@ Each configuration change generates an immutable evidence envelope:
 ## 4. Operational Paths
 
 ### 4.1 Normal Path
-1. Authenticated administrator (`role === "admin"`) submits a configuration change with a setting key, new value, and mandatory reason (minimum 5 characters).
-2. Input is validated against registry bounds and type requirements.
-3. If the setting is classified as `CRITICAL`, secondary maintainer approval (`approvalEvidence.approver !== actor.id`) is verified.
-4. The current setting is read from the `system_config` collection. If the proposed value equals the current value, it is rejected as `NOOP_MUTATION`.
-5. The latest evidence entry is read to determine `sequence = last.sequence + 1` and `previousEvidenceHash = last.recordHash`.
-6. Evidence envelope is created with actor commitment proof and canonical HMAC signature.
-7. Evidence is persisted to `config_audit_evidence`.
-8. Active configuration is updated in `system_config`.
+1. An authenticated administrator (`role === "admin"`) submits a `preview` request with a setting key, new value, and mandatory reason (minimum 5 characters).
+2. Input is validated against registry bounds and type requirements; the response returns a masked before/after diff and a five-minute preview token. Previewing performs no writes.
+3. The administrator reviews the diff and submits an `apply` request containing that token. The server rechecks the exact actor, current value, proposed value, reason, and approval evidence.
+4. If the setting is classified as `CRITICAL`, secondary maintainer approval (`approvalEvidence.approver !== actor.id`) is required for the apply request.
+5. If the proposed value equals the current value, or the current setting has changed since preview, the request is rejected.
+6. The latest evidence entry is read to determine `sequence = last.sequence + 1` and `previousEvidenceHash = last.recordHash`.
+7. Evidence envelope, including before/after values and the justification, is created with actor commitment proof and canonical HMAC signature.
+8. Evidence is persisted to `config_audit_evidence`; only then is active configuration updated in `system_config`.
 
 ### 4.2 Failure Path
 - **Unauthorized Actor**: Callers without the `admin` role are rejected with `403 UNAUTHORIZED_ADMIN`.
@@ -107,6 +108,7 @@ Each configuration change generates an immutable evidence envelope:
 - **Missing Reason**: Omitting a justification reason fails with `400 MISSING_AUDIT_REASON`.
 - **Dual-Approval Missing**: Critical settings without a secondary approver fail with `428 DUAL_APPROVAL_REQUIRED`.
 - **Self-Approval Violation**: Submitting the requesting admin as secondary approver fails with `422 SELF_APPROVAL_FORBIDDEN`.
+- **Missing / Stale Preview**: A new apply without a preview token fails with `428 CONFIG_PREVIEW_REQUIRED`; altered or expired previews fail with `409 CONFIG_PREVIEW_STALE` or `CONFIG_PREVIEW_EXPIRED`.
 - **Write Failure**: If database persistence of the evidence envelope fails, the active configuration is **never updated** (fail-closed guarantee).
 
 ### 4.3 Retry Path
@@ -128,7 +130,7 @@ To revert a configuration change:
 3. The system fetches the target evidence record, retrieves its `before` state, and generates a **new** evidence entry of type `CONFIG_ROLLBACK` referencing `targetEvidenceId: evidenceId`.
 4. If the target change was `CRITICAL`, the rollback itself enforces two-person secondary approval.
 5. Active configuration is updated to the previous value.
-6. Original historical records remain completely untouched.
+6. Original historical records remain completely untouched. The rollback request must include a justification reason, which is recorded alongside the before/after values; this note is part of the permanent rollback evidence.
 
 ### 5.2 Chain Verification & Forensic Tamper Detection
 To verify the entire configuration history:
@@ -166,9 +168,24 @@ If verification reports a broken sequence or hash mismatch:
 Retrieves all registered configuration definitions, active stored values, recent audit evidence entries, and live chain verification status.
 
 ### `POST /api/admin/config`
-Applies an administrative configuration change.
+First request a schema-validated preview. The response includes a masked diff and a short-lived token; previewing does not write configuration or audit records.
 ```json
 {
+  "action": "preview",
+  "settingKey": "marketplace.platformFeeBps",
+  "value": 300,
+  "reason": "Q4 platform fee adjustment approved by governance committee",
+  "approvalEvidence": {
+    "approver": "admin_secondary_id",
+    "reason": "Reviewed and signed off"
+  }
+}
+```
+
+Apply only after reviewing the returned diff. The token is bound to the actor, current value, proposed value, reason, and approval evidence, and expires after five minutes.
+```json
+{
+  "action": "apply",
   "settingKey": "marketplace.platformFeeBps",
   "value": 300,
   "reason": "Q4 platform fee adjustment approved by governance committee",
@@ -176,7 +193,8 @@ Applies an administrative configuration change.
   "approvalEvidence": {
     "approver": "admin_secondary_id",
     "reason": "Reviewed and signed off"
-  }
+  },
+  "previewToken": "<previewToken from the preview response>"
 }
 ```
 
@@ -204,7 +222,7 @@ Exports verifiable evidence bundles with optional filters (`settingKey`, `catego
   ```bash
   node --test tests/backend/admin-config-audit-evidence.test.mjs
   ```
-  *Coverage*: Registry validation, secret redaction, normal path, hash chain integrity, dual-approval, self-approval prevention, idempotent retries, tamper detection, append-only rollback, and bundle export.
+  *Coverage*: Registry validation, secret redaction, non-mutating preview, required and stale preview rejection, normal path, hash chain integrity, dual-approval, self-approval prevention, idempotent retries, tamper detection, append-only rollback notes, and bundle export.
 
 - **Vitest Unit & API Tests**:
   ```bash

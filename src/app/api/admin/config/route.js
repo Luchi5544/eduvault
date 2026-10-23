@@ -8,6 +8,7 @@ import {
   CONFIG_SETTING_REGISTRY,
   ConfigAuditError,
   applyAdminConfigChange,
+  createAdminConfigPreview,
   verifyConfigAuditChain,
 } from '@/lib/config/adminConfigAudit';
 import { COLLECTIONS } from '@/lib/backend/schemaContracts';
@@ -62,15 +63,17 @@ export async function GET(request) {
 
 /**
  * POST /api/admin/config
- * Applies an administrative configuration change with full audit evidence.
+ * Previews or applies an administrative configuration change with full audit evidence.
  *
  * Request Body:
  * {
+ *   action: "preview" | "apply",
  *   settingKey: string,
- *   value: any,
+ *   value: unknown,
  *   reason: string (min 5 chars),
  *   operationId?: string,
- *   approvalEvidence?: { approver: string, reason?: string, approvalToken?: string }
+ *   approvalEvidence?: { approver: string, reason?: string, approvalToken?: string },
+ *   previewToken?: string (required for action: "apply")
  * }
  */
 export async function POST(request) {
@@ -81,17 +84,35 @@ export async function POST(request) {
 
   try {
     const body = await request.json().catch(() => ({}));
-    const { settingKey, value, reason, operationId, approvalEvidence } = body;
+    const { action = 'apply', settingKey, value, reason, operationId, approvalEvidence, previewToken } = body;
+    if (action !== 'preview' && action !== 'apply') {
+      return NextResponse.json(
+        { error: 'action must be either "preview" or "apply".', code: 'INVALID_CONFIG_ACTION' },
+        { status: 400 }
+      );
+    }
 
-    const opId = operationId || request.headers.get('x-idempotency-key') || undefined;
-
-    const result = await applyAdminConfigChange({
-      operationId: opId,
+    const db = await getDb();
+    const change = {
+      db,
       settingKey,
       proposedValue: value,
       actor: admin,
       reason,
       approvalEvidence,
+    };
+
+    if (action === 'preview') {
+      const preview = await createAdminConfigPreview(change);
+      return NextResponse.json(preview, { status: 200 });
+    }
+
+    const opId = operationId || request.headers.get('x-idempotency-key') || undefined;
+
+    const result = await applyAdminConfigChange({
+      ...change,
+      operationId: opId,
+      previewToken,
     });
 
     return NextResponse.json(result, { status: 200 });

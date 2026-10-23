@@ -12,10 +12,19 @@ import {
   buildConfigAuditEvidence,
   verifyConfigAuditEvidence,
   verifyConfigAuditChain,
-  applyAdminConfigChange,
+  applyAdminConfigChange as applyAdminConfigChangeRaw,
+  createAdminConfigPreview,
   rollbackConfigChange,
   exportConfigAuditBundle,
 } from '../adminConfigAudit.js';
+
+async function applyAdminConfigChange(options) {
+  const preview = options.previewToken
+    ? { previewToken: options.previewToken }
+    : await createAdminConfigPreview(options);
+  const result = await applyAdminConfigChangeRaw({ ...options, previewToken: preview.previewToken });
+  return { ...result, previewToken: preview.previewToken };
+}
 
 function createMockCollection(initialDocs = []) {
   const docs = [...initialDocs];
@@ -230,6 +239,7 @@ describe('Administrative Configuration Change Audit Evidence (Vitest)', () => {
         proposedValue: true,
         actor: adminActor,
         reason: 'Enabling emergency maintenance mode (retry)',
+        previewToken: first.previewToken,
       });
 
       expect(second.idempotentReplay).toBe(true);

@@ -667,6 +667,195 @@ async function resolveDb(injectedDb) {
   return getDb();
 }
 
+export const CONFIG_PREVIEW_TTL_MS = 5 * 60 * 1000;
+
+function validateConfigChangeInput({ settingKey, proposedValue, actor, reason, approvalEvidence }, requireApproval) {
+  if (!actor || actor.role !== 'admin') {
+    throw new ConfigAuditError(
+      'Unauthorized. Administrative privileges required to modify system configuration.',
+      'UNAUTHORIZED_ADMIN',
+      403
+    );
+  }
+
+  const settingMeta = validateConfigSetting(settingKey, proposedValue);
+  if (!reason || typeof reason !== 'string' || reason.trim().length < 5) {
+    throw new ConfigAuditError(
+      'A valid justification reason (minimum 5 characters) is mandatory.',
+      'MISSING_AUDIT_REASON',
+      400
+    );
+  }
+
+  if (settingMeta.dualApprovalRequired) {
+    if (!approvalEvidence?.approver) {
+      if (requireApproval) {
+        throw new ConfigAuditError(
+          `Critical severity setting "${settingMeta.settingKey}" requires secondary maintainer approval (approvalEvidence.approver).`,
+          'DUAL_APPROVAL_REQUIRED',
+          428,
+          { requiredField: 'approvalEvidence.approver' }
+        );
+      }
+      return settingMeta;
+    }
+
+    const primaryActorId = String(actor.id || actor.sub || actor).trim().toLowerCase();
+    const secondaryApproverId = String(approvalEvidence.approver).trim().toLowerCase();
+    if (primaryActorId === secondaryApproverId) {
+      throw new ConfigAuditError(
+        'Two-person rule violation: Secondary approver cannot be the same maintainer requesting the change.',
+        'SELF_APPROVAL_FORBIDDEN',
+        422
+      );
+    }
+  }
+
+  return settingMeta;
+}
+
+function previewValueHash(value) {
+  return crypto.createHash('sha256').update(canonicalize(value)).digest('hex');
+}
+
+function createPreviewToken(payload, signingKey) {
+  const encodedPayload = Buffer.from(canonicalize(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', signingKey).update(encodedPayload).digest('base64url');
+  return `${encodedPayload}.${signature}`;
+}
+
+function assertPreviewTokenMatches({
+  previewToken,
+  settingKey,
+  before,
+  after,
+  actor,
+  reason,
+  approvalEvidence,
+  signingKey,
+  now,
+}) {
+  if (!previewToken || typeof previewToken !== 'string') {
+    throw new ConfigAuditError(
+      'A current configuration preview is required before applying this change.',
+      'CONFIG_PREVIEW_REQUIRED',
+      428
+    );
+  }
+
+  const [encodedPayload, suppliedSignature, extra] = previewToken.split('.');
+  if (!encodedPayload || !suppliedSignature || extra !== undefined) {
+    throw new ConfigAuditError('The configuration preview token is invalid.', 'CONFIG_PREVIEW_INVALID', 409);
+  }
+
+  const expectedSignature = crypto.createHmac('sha256', signingKey).update(encodedPayload).digest();
+  const providedSignature = Buffer.from(suppliedSignature, 'base64url');
+  if (
+    providedSignature.length !== expectedSignature.length ||
+    !crypto.timingSafeEqual(providedSignature, expectedSignature)
+  ) {
+    throw new ConfigAuditError('The configuration preview token is invalid.', 'CONFIG_PREVIEW_INVALID', 409);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+  } catch {
+    throw new ConfigAuditError('The configuration preview token is invalid.', 'CONFIG_PREVIEW_INVALID', 409);
+  }
+
+  const actorId = String(actor.id || actor.sub || actor);
+  if (
+    payload.version !== 1 ||
+    payload.actorid !== actorId ||
+    payload.settingkey !== settingKey ||
+    payload.beforehash !== previewValueHash(before) ||
+    payload.afterhash !== previewValueHash(after) ||
+    payload.reasonhash !== previewValueHash(reason.trim()) ||
+    payload.approvalhash !== previewValueHash(approvalEvidence)
+  ) {
+    throw new ConfigAuditError(
+      'The configuration changed after preview or the preview belongs to a different request.',
+      'CONFIG_PREVIEW_STALE',
+      409
+    );
+  }
+
+  if (!Number.isFinite(Date.parse(payload.expiresat)) || Date.parse(payload.expiresat) <= now.getTime()) {
+    throw new ConfigAuditError('The configuration preview has expired.', 'CONFIG_PREVIEW_EXPIRED', 409);
+  }
+}
+
+/**
+ * Validates a proposed change and returns its masked before/after diff with a
+ * short-lived token bound to the actor, values, reason, and current setting.
+ */
+export async function createAdminConfigPreview({
+  db: injectedDb,
+  settingKey,
+  proposedValue,
+  actor,
+  reason,
+  approvalEvidence = null,
+  signingKey = DEFAULT_AUDIT_SIGNING_KEY,
+  now = new Date(),
+}) {
+  const settingMeta = validateConfigChangeInput(
+    { settingKey, proposedValue, actor, reason, approvalEvidence },
+    false
+  );
+  const normalizedKey = settingMeta.settingKey;
+  const db = await resolveDb(injectedDb);
+  const configCol = db.collection(COLLECTIONS.systemConfig || 'system_config');
+  const currentConfigDoc = await configCol.findOne({ _id: normalizedKey });
+  const currentValue =
+    currentConfigDoc?.value !== undefined
+      ? currentConfigDoc.value
+      : settingMeta.rule?.defaultValue ?? null;
+
+  if (canonicalize(currentValue) === canonicalize(proposedValue)) {
+    throw new ConfigAuditError(
+      `No-op change: setting "${normalizedKey}" already has the value ${JSON.stringify(proposedValue)}.`,
+      'NOOP_MUTATION',
+      400
+    );
+  }
+
+  const previewId = crypto.randomBytes(16).toString('hex');
+  const expiresAt = new Date(now.getTime() + CONFIG_PREVIEW_TTL_MS).toISOString();
+  const payload = {
+    version: 1,
+    previewid: previewId,
+    actorid: String(actor.id || actor.sub || actor),
+    settingkey: normalizedKey,
+    beforehash: previewValueHash(currentValue),
+    afterhash: previewValueHash(proposedValue),
+    reasonhash: previewValueHash(reason.trim()),
+    approvalhash: previewValueHash(approvalEvidence),
+    expiresat: expiresAt,
+  };
+  const preview = {
+    previewId,
+    settingKey: normalizedKey,
+    category: settingMeta.category,
+    severity: settingMeta.severity,
+    requiresSecondaryApproval: settingMeta.dualApprovalRequired,
+    before: maskSensitiveConfigValue(normalizedKey, currentValue),
+    after: maskSensitiveConfigValue(normalizedKey, proposedValue),
+    diff: {
+      from: maskSensitiveConfigValue(normalizedKey, currentValue),
+      to: maskSensitiveConfigValue(normalizedKey, proposedValue),
+    },
+    expiresAt,
+  };
+
+  return {
+    success: true,
+    preview,
+    previewToken: createPreviewToken(payload, signingKey),
+  };
+}
+
 /**
  * Main mutating function: applies an administrative configuration change with full audit evidence.
  *
@@ -687,53 +876,15 @@ export async function applyAdminConfigChange({
   actor,
   reason,
   approvalEvidence = null,
+  previewToken,
   signingKey = DEFAULT_AUDIT_SIGNING_KEY,
   now = new Date(),
 }) {
-  // 1. Authorization check
-  if (!actor || actor.role !== 'admin') {
-    throw new ConfigAuditError(
-      'Unauthorized. Administrative privileges required to modify system configuration.',
-      'UNAUTHORIZED_ADMIN',
-      403
-    );
-  }
-
-  // 2. Validate setting & proposed value
-  const settingMeta = validateConfigSetting(settingKey, proposedValue);
+  const settingMeta = validateConfigChangeInput(
+    { settingKey, proposedValue, actor, reason, approvalEvidence },
+    true
+  );
   const normalizedKey = settingMeta.settingKey;
-
-  // 3. Mandatory justification reason
-  if (!reason || typeof reason !== 'string' || reason.trim().length < 5) {
-    throw new ConfigAuditError(
-      'A valid justification reason (minimum 5 characters) is mandatory.',
-      'MISSING_AUDIT_REASON',
-      400
-    );
-  }
-
-  // 4. Dual-approval enforcement for CRITICAL changes
-  if (settingMeta.dualApprovalRequired) {
-    if (!approvalEvidence || !approvalEvidence.approver) {
-      throw new ConfigAuditError(
-        `Critical severity setting "${normalizedKey}" requires secondary maintainer approval (approvalEvidence.approver).`,
-        'DUAL_APPROVAL_REQUIRED',
-        428,
-        { requiredField: 'approvalEvidence.approver' }
-      );
-    }
-
-    const primaryActorId = String(actor.id || actor.sub || actor).trim().toLowerCase();
-    const secondaryApproverId = String(approvalEvidence.approver).trim().toLowerCase();
-
-    if (primaryActorId === secondaryApproverId) {
-      throw new ConfigAuditError(
-        'Two-person rule violation: Secondary approver cannot be the same maintainer requesting the change.',
-        'SELF_APPROVAL_FORBIDDEN',
-        422
-      );
-    }
-  }
 
   const db = await resolveDb(injectedDb);
   const evidenceCol = db.collection(COLLECTIONS.configAuditEvidence || 'config_audit_evidence');
@@ -757,6 +908,18 @@ export async function applyAdminConfigChange({
     currentConfigDoc?.value !== undefined
       ? currentConfigDoc.value
       : settingMeta.rule?.defaultValue ?? null;
+
+  assertPreviewTokenMatches({
+    previewToken,
+    settingKey: normalizedKey,
+    before: currentValue,
+    after: proposedValue,
+    actor,
+    reason,
+    approvalEvidence,
+    signingKey,
+    now,
+  });
 
   // No-op check: if the value is unchanged, reject to prevent spurious noise in the tamper-evident chain
   if (canonicalize(currentValue) === canonicalize(proposedValue)) {

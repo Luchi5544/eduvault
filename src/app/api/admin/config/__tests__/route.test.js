@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     mockRequireAdmin: vi.fn(),
+    mockCreateAdminConfigPreview: vi.fn(),
     mockApplyAdminConfigChange: vi.fn(),
     mockRollbackConfigChange: vi.fn(),
     mockExportConfigAuditBundle: vi.fn(),
@@ -36,6 +37,7 @@ vi.mock('@/lib/config/adminConfigAudit', async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
+    createAdminConfigPreview: (params) => mocks.mockCreateAdminConfigPreview(params),
     applyAdminConfigChange: (params) => mocks.mockApplyAdminConfigChange(params),
     rollbackConfigChange: (params) => mocks.mockRollbackConfigChange(params),
     exportConfigAuditBundle: (params) => mocks.mockExportConfigAuditBundle(params),
@@ -86,6 +88,33 @@ describe('Admin Config API Routes', () => {
       expect(res.status).toBe(403);
     });
 
+    it('returns a schema-validated diff preview without applying the change', async () => {
+      mocks.mockRequireAdmin.mockResolvedValue({ id: 'admin_1', role: 'admin' });
+      mocks.mockCreateAdminConfigPreview.mockResolvedValue({
+        success: true,
+        preview: { settingKey: 'maintenance.global', diff: { from: false, to: true } },
+        previewToken: 'signed-preview',
+      });
+
+      const req = new Request('http://localhost:3000/api/admin/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'preview',
+          settingKey: 'maintenance.global',
+          value: true,
+          reason: 'Scheduled platform maintenance window',
+        }),
+      });
+
+      const res = await POST(req);
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.preview.diff).toEqual({ from: false, to: true });
+      expect(json.previewToken).toBe('signed-preview');
+      expect(mocks.mockApplyAdminConfigChange).not.toHaveBeenCalled();
+    });
+
     it('delegates to applyAdminConfigChange and returns 200 on success', async () => {
       mocks.mockRequireAdmin.mockResolvedValue({ id: 'admin_1', role: 'admin' });
       mocks.mockApplyAdminConfigChange.mockResolvedValue({
@@ -98,9 +127,11 @@ describe('Admin Config API Routes', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-idempotency-key': 'idem-key-1' },
         body: JSON.stringify({
+          action: 'apply',
           settingKey: 'maintenance.global',
           value: true,
           reason: 'Scheduled platform maintenance window',
+          previewToken: 'signed-preview',
         }),
       });
 
@@ -114,6 +145,7 @@ describe('Admin Config API Routes', () => {
           settingKey: 'maintenance.global',
           proposedValue: true,
           operationId: 'idem-key-1',
+          previewToken: 'signed-preview',
         })
       );
     });
